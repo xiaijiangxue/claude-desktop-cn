@@ -599,50 +599,21 @@ const CodePage = ({ desktopTabId }: CodePageProps) => {
     navigate('/');
   }, [navigate]);
 
-  const buildAssistantContextPrompt = useCallback((nextPrompt: string) => {
+  const buildAssistantContextPrompt = useCallback((nextPrompt: string, options?: { includeCurrentFile?: boolean }) => {
+    const includeCurrentFile = options?.includeCurrentFile ?? false;
     return [
       workspacePath ? `${isZh ? '当前工作区' : 'Current workspace'}：${workspacePath}` : '',
-      selectedFileRelativePath ? `${isZh ? '当前文件' : 'Current file'}：${selectedFileRelativePath}` : '',
-      selectedFileRelativePath && isEditableFile
+      includeCurrentFile && selectedFileRelativePath ? `${isZh ? '当前文件' : 'Current file'}：${selectedFileRelativePath}` : '',
+      includeCurrentFile && selectedFileRelativePath && isEditableFile
         ? `${isZh ? '当前文件内容摘要（回答时请优先参考这里）' : 'Current file excerpt (please prioritize this while answering)'}：\n\`\`\`\n${assistantFilePreview}\n\`\`\``
         : '',
       attachmentContextBlock ? `${isZh ? '附加上下文' : 'Attached context'}：\n${attachmentContextBlock}` : '',
-      isDirty
+      includeCurrentFile && isDirty
         ? (isZh ? '注意：当前文件有未保存的本地修改，回答时请把这些改动也算进去。' : 'Note: the current file has unsaved local edits. Please include them in your reasoning.')
         : '',
       nextPrompt,
     ].filter(Boolean).join('\n\n');
   }, [assistantFilePreview, attachmentContextBlock, isDirty, isEditableFile, isZh, selectedFileRelativePath, workspacePath]);
-
-  const enrichAssistantPrompt = useCallback((nextPrompt: string) => {
-    return [
-      selectedFileRelativePath && isEditableFile && assistantFilePreview
-        ? `${isZh ? '补充上下文：请优先参考我当前打开文件的内容。' : 'Extra context: please prioritize the file I currently have open.'}\n\`\`\`\n${assistantFilePreview}\n\`\`\``
-        : '',
-      attachmentContextBlock
-        ? `${isZh ? '补充上下文：请一并参考这些附件内容。' : 'Extra context: please also use the attached files.'}\n${attachmentContextBlock}`
-        : '',
-      isDirty
-        ? (isZh ? '补充上下文：这个文件还有未保存的本地修改，回答时请一起考虑。' : 'Extra context: this file has unsaved local edits. Please include them in your reasoning.')
-        : '',
-      nextPrompt,
-    ].filter(Boolean).join('\n\n');
-  }, [assistantFilePreview, attachmentContextBlock, isDirty, isEditableFile, isZh, selectedFileRelativePath]);
-
-  const sendAssistantDraftWithContext = useCallback(() => {
-    const nextPrompt = assistantDraft.trim();
-    if (!nextPrompt) return;
-    setAssistantDraft('');
-    launchClaudeTask(buildAssistantContextPrompt(nextPrompt));
-  }, [assistantDraft, buildAssistantContextPrompt, launchClaudeTask]);
-
-  const sendAssistantDraft = useCallback(() => {
-    const nextPrompt = assistantDraft.trim();
-    if (!nextPrompt) return;
-    const context = buildAssistantContextPrompt(nextPrompt);
-    setAssistantDraft('');
-    launchClaudeTask(context);
-  }, [assistantDraft, buildAssistantContextPrompt, launchClaudeTask]);
 
   const openAssistantUpload = useCallback(() => {
     assistantFileInputRef.current?.click();
@@ -800,11 +771,11 @@ const CodePage = ({ desktopTabId }: CodePageProps) => {
     };
   }, []);
 
-  const sendEmbeddedAssistantPrompt = useCallback(async (rawPrompt: string) => {
+  const sendEmbeddedAssistantPrompt = useCallback(async (rawPrompt: string, options?: { includeCurrentFile?: boolean }) => {
     const nextPrompt = rawPrompt.trim();
     if (!nextPrompt || assistantStreaming) return;
 
-    const contextPrompt = buildAssistantContextPrompt(nextPrompt);
+    const contextPrompt = buildAssistantContextPrompt(nextPrompt, options);
 
     setAssistantError('');
     setAssistantStreaming(true);
@@ -904,18 +875,18 @@ const CodePage = ({ desktopTabId }: CodePageProps) => {
         return next.slice(-10);
       });
     }
-  }, [assistantConversationId, assistantStreaming, isZh, selectedFileRelativePath, workspacePath]);
+  }, [assistantConversationId, assistantStreaming, buildAssistantContextPrompt, isZh]);
 
   const sendEmbeddedAssistantPromptWithContext = useCallback(async (rawPrompt: string) => {
-    await sendEmbeddedAssistantPrompt(enrichAssistantPrompt(rawPrompt));
-  }, [enrichAssistantPrompt, sendEmbeddedAssistantPrompt]);
+    await sendEmbeddedAssistantPrompt(rawPrompt, { includeCurrentFile: true });
+  }, [sendEmbeddedAssistantPrompt]);
 
   const sendEmbeddedAssistantMessage = useCallback(async () => {
     const nextPrompt = assistantDraft.trim();
     if (!nextPrompt) return;
     setAssistantDraft('');
-    await sendEmbeddedAssistantPromptWithContext(nextPrompt);
-  }, [assistantDraft, sendEmbeddedAssistantPromptWithContext]);
+    await sendEmbeddedAssistantPrompt(nextPrompt);
+  }, [assistantDraft, sendEmbeddedAssistantPrompt]);
 
   const askAboutSelectedFile = useCallback(() => {
     if (!selectedFileRelativePath) return;
