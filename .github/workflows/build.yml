@@ -86,3 +86,75 @@ jobs:
             release/Claude-Desktop-CN-Setup-*.exe
             release/Claude-Desktop-CN-Setup-*.exe.blockmap
             release/latest.yml
+
+  macos:
+    name: Build macOS installer
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install app dependencies
+        run: npm ci
+
+      - name: Install engine dependencies
+        working-directory: engine
+        run: bun install
+
+      - name: Copy Bun runtime into app resources
+        run: |
+          mkdir -p engine/bin
+          BUN_PATH=$(which bun)
+          cp "$BUN_PATH" engine/bin/bun
+          chmod +x engine/bin/bun
+          ls -la engine/bin
+
+      - name: Write build-time secrets
+        env:
+          GH_OAUTH_CLIENT_ID: ${{ secrets.GH_OAUTH_CLIENT_ID }}
+          GH_OAUTH_CLIENT_SECRET: ${{ secrets.GH_OAUTH_CLIENT_SECRET }}
+        run: |
+          node -e "const fs=require('fs'); const secrets={}; if(process.env.GH_OAUTH_CLIENT_ID) secrets.GITHUB_CLIENT_ID=process.env.GH_OAUTH_CLIENT_ID; if(process.env.GH_OAUTH_CLIENT_SECRET) secrets.GITHUB_CLIENT_SECRET=process.env.GH_OAUTH_CLIENT_SECRET; fs.writeFileSync('electron/secrets.json', JSON.stringify(secrets,null,2)); console.log('secrets.json written, keys:', Object.keys(secrets));"
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build macOS installer
+        run: npx electron-builder --mac --publish never
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Upload macOS installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Claude-Desktop-CN-macOS
+          path: |
+            release/*.dmg
+            release/*.zip
+            release/latest-mac.yml
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Publish macOS to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Claude Desktop CN ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          body_path: docs/releases/${{ github.ref_name }}-cn.md
+          files: |
+            release/*.dmg
+            release/*.zip
+            release/latest-mac.yml
