@@ -1,166 +1,125 @@
-const { app, BrowserWindow, ipcMain, dialog, shell, globalShortcut, Tray, Menu, nativeImage, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, shell, Tray, Menu, autoUpdater } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const { spawn } = require('child_process');
 const archiver = require('archiver');
-const { autoUpdater } = require('electron-updater');
-// Load build-time secrets before requiring bridge-server so they're available on process.env.
-// secrets.json is gitignored 鈥?populated by CI at build time from GitHub Actions secrets.
-// In dev just export the env vars in your shell (or put them in this file locally).
-try {
-    const secretsPath = path.join(__dirname, 'secrets.json');
-    if (fs.existsSync(secretsPath)) {
-        const raw = fs.readFileSync(secretsPath, 'utf8').replace(/^\uFEFF/, '');
-        const s = JSON.parse(raw);
-        for (const [k, v] of Object.entries(s)) {
-            if (!process.env[k]) process.env[k] = String(v);
-        }
-    }
-} catch (_) {}
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
 
-const { initServer, enableNodeModeForChildProcesses } = require('./bridge-server.cjs');
+const isDev = !app.isPackaged;
+const isWindows = process.platform === 'win32';
 
-// Fix Chinese garbled text in Windows console by switching to UTF-8 code page
-if (process.platform === 'win32') {
-    try { require('child_process').execSync('chcp 65001', { stdio: 'ignore' }); } catch (_) {}
-    process.stdout.setEncoding?.('utf8');
-    process.stderr.setEncoding?.('utf8');
-}
-
-// Squirrel startup handler removed 鈥?using NSIS installer, not Squirrel
-
-let mainWindow;
+let mainWindow = null;
 let tray = null;
 let isQuitting = false;
 let hasShownTrayHint = false;
-
-const isDev = process.env.NODE_ENV === 'development';
-const isWindows = process.platform === 'win32';
 let lastRendererRecoveryAt = 0;
 
-function appendMainLog(scope, message) {
+function getWindowIconPath() {
+    if (process.platform === 'darwin') {
+        return undefined; // macOS uses the app bundle icon
+    }
+    return path.join(__dirname, '..', 'public', 'favicon.ico');
+}
+
+function appendMainLog(tag, message) {
     try {
-        const line = `[${new Date().toISOString()}] [${scope}] ${message}\n`;
-        fs.appendFileSync(path.join(app.getPath('userData'), 'main-process.log'), line, 'utf8');
+        const logPath = path.join(app.getPath('userData'), 'main-process.log');
+        const timestamp = new Date().toISOString();
+        const line = `[${timestamp}] [${tag}] ${message}\n`;
+        fs.appendFileSync(logPath, line, 'utf8');
     } catch (_) {}
 }
 
-function spawnDetached(command, args, options = {}) {
+function initServer() {
+    const serverApp = express();
+    serverApp.use(cors());
+    serverApp.use(express.json());
+
+    const upload = multer({ dest: path.join(app.getPath('userData'), 'uploads') });
+
+    serverApp.get('/api/health', (req, res) => {
+        res.json({ status: 'ok', platform: process.platform });
+    });
+
+    serverApp.post('/api/upload', upload.single('file'), (req, res) => {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded' });
+        }
+        res.json({
+            success: true,
+            filename: req.file.originalname,
+            path: req.file.path,
+            size: req.file.size,
+        });
+    });
+
+    serverApp.get('/api/download/:filename', (req, res) => {
+        const filePath = path.join(app.getPath('userData'), 'uploads', req.params.filename);
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ error: 'File not found' });
+        }
+        res.download(filePath);
+    });
+
+    return serverApp;
+}
+
+function enableNodeModeForChildProcesses() {
+    // No-op: this build uses direct API calls instead of SDK subprocess
+}
+
+function firstExistingPath(paths) {
+    for (const p of paths) {
+        if (fs.existsSync(p)) return p;
+    }
+    return null;
+}
+
+function findPyCharmExe() {
+    const candidates = [
+        path.join(process.env['ProgramFiles'] || '', 'JetBrains', 'PyCharm Community Edition', 'bin', 'pycharm64.exe'),
+        path.join(process.env['ProgramFiles'] || '', 'JetBrains', 'PyCharm Professional', 'bin', 'pycharm64.exe'),
+        path.join(process.env['LocalAppData'] || '', 'JetBrains', 'Toolbox', 'apps', 'PyCharm-C', 'ch-0', '*', 'bin', 'pycharm64.exe'),
+        path.join(process.env['LocalAppData'] || '', 'JetBrains', 'Toolbox', 'apps', 'PyCharm-P', 'ch-0', '*', 'bin', 'pycharm64.exe'),
+    ];
+    for (const p of candidates) {
+        if (p.includes('*')) {
+            const dir = path.dirname(p);
+            if (fs.existsSync(dir)) {
+                const versions = fs.readdirSync(dir).filter(d => /^\d+/.test(d)).sort();
+                if (versions.length > 0) {
+                    const resolved = path.join(dir, versions[versions.length - 1], 'bin', 'pycharm64.exe');
+                    if (fs.existsSync(resolved)) return resolved;
+                }
+            }
+        } else if (fs.existsSync(p)) {
+            return p;
+        }
+    }
+    return null;
+}
+
+function spawnDetached(command, args, options) {
     try {
-        const child = require('child_process').spawn(command, args, {
+        const child = spawn(command, args, {
+            ...options,
             detached: true,
             stdio: 'ignore',
-            windowsHide: true,
-            ...options,
         });
         child.unref();
         return true;
-    } catch (_) {
+    } catch (error) {
+        console.error('spawnDetached failed:', error);
         return false;
     }
 }
 
-function firstExistingPath(candidates) {
-    return candidates.find(candidate => candidate && fs.existsSync(candidate)) || null;
-}
-
-function findPyCharmExe() {
-    const directCandidates = [
-        path.join(process.env['ProgramFiles'] || '', 'JetBrains', 'PyCharm Community Edition 2025.1', 'bin', 'pycharm64.exe'),
-        path.join(process.env['ProgramFiles'] || '', 'JetBrains', 'PyCharm Community Edition 2024.3', 'bin', 'pycharm64.exe'),
-        path.join(process.env['ProgramFiles'] || '', 'JetBrains', 'PyCharm 2025.1', 'bin', 'pycharm64.exe'),
-        path.join(process.env['ProgramFiles'] || '', 'JetBrains', 'PyCharm 2024.3', 'bin', 'pycharm64.exe'),
-        path.join(process.env['LocalAppData'] || '', 'Programs', 'PyCharm Community', 'bin', 'pycharm64.exe'),
-    ];
-    const direct = firstExistingPath(directCandidates);
-    if (direct) return direct;
-
-    const toolboxRoot = path.join(process.env['LocalAppData'] || '', 'JetBrains', 'Toolbox', 'apps', 'PyCharm-C');
-    if (!fs.existsSync(toolboxRoot)) return null;
-    try {
-        const channels = fs.readdirSync(toolboxRoot, { withFileTypes: true })
-            .filter(entry => entry.isDirectory())
-            .map(entry => entry.name);
-        for (const channel of channels) {
-            const channelPath = path.join(toolboxRoot, channel);
-            const versions = fs.readdirSync(channelPath, { withFileTypes: true })
-                .filter(entry => entry.isDirectory())
-                .map(entry => entry.name)
-                .sort()
-                .reverse();
-            for (const version of versions) {
-                const exe = path.join(channelPath, version, 'bin', 'pycharm64.exe');
-                if (fs.existsSync(exe)) return exe;
-            }
-        }
-    } catch (_) {}
-    return null;
-}
-
 function sanitizePreviewName(name) {
-    const fallback = 'artifact-preview.html';
-    const base = String(name || fallback)
-        .replace(/[<>:"/\\|?*\x00-\x1F]/g, '-')
-        .replace(/\s+/g, ' ')
-        .trim();
-    const withExt = /\.html?$/i.test(base) ? base : `${base || 'artifact-preview'}.html`;
-    return withExt || fallback;
-}
-
-function getPublicIconPath(fileName) {
-    return path.join(__dirname, '..', 'public', fileName);
-}
-
-function getDistIconPath(fileName) {
-    return path.join(__dirname, '..', 'dist', fileName);
-}
-
-function getPackagedIconPath(fileName) {
-    return path.join(process.resourcesPath, 'assets', fileName);
-}
-
-function getRuntimeIconPath(fileName) {
-    return firstExistingPath([
-        app.isPackaged ? getPackagedIconPath(fileName) : null,
-        getDistIconPath(fileName),
-        getPublicIconPath(fileName),
-    ]);
-}
-
-function getWindowIconPath() {
-    return firstExistingPath([
-        process.platform === 'win32' ? getRuntimeIconPath('favicon.ico') : null,
-        getRuntimeIconPath('favicon.png'),
-    ]);
-}
-
-function getTrayIcon() {
-    const trayIcoPath = getRuntimeIconPath('favicon.ico');
-    const trayPngPath = getRuntimeIconPath('favicon.png');
-
-    if (trayPngPath && fs.existsSync(trayPngPath)) {
-        const baseIcon = nativeImage.createFromPath(trayPngPath);
-        if (!baseIcon.isEmpty()) {
-            const scaleFactor = Math.max(1, Math.round(screen.getPrimaryDisplay?.().scaleFactor || 1));
-            const size = process.platform === 'darwin' ? 18 : 16 * scaleFactor;
-            const resized = baseIcon.resize({ width: size, height: size, quality: 'best' });
-            appendMainLog('tray-icon', `using png icon ${trayPngPath} (${size}x${size})`);
-            return resized;
-        }
-    }
-
-    if (process.platform === 'win32' && trayIcoPath && fs.existsSync(trayIcoPath)) {
-        appendMainLog('tray-icon', `using ico fallback ${trayIcoPath}`);
-        return trayIcoPath;
-    }
-
-    const fallbackPath = getWindowIconPath();
-    if (fallbackPath && fs.existsSync(fallbackPath)) {
-        appendMainLog('tray-icon', `using window icon fallback ${fallbackPath}`);
-        return fallbackPath;
-    }
-
-    appendMainLog('tray-icon', 'no icon available, using empty native image');
-    return nativeImage.createEmpty();
+    if (!name) return 'preview.html';
+    const safe = String(name).replace(/[^a-zA-Z0-9\u4e00-\u9fa5._-]/g, '_').substring(0, 100);
+    return safe.endsWith('.html') ? safe : `${safe}.html`;
 }
 
 function showMainWindow() {
@@ -178,32 +137,29 @@ function showMainWindow() {
 }
 
 function createTray() {
-    if (tray) return;
-    const trayIcon = getTrayIcon();
-    tray = new Tray(trayIcon);
-    tray.setImage(trayIcon);
+    const iconPath = process.platform === 'darwin'
+        ? path.join(__dirname, '..', 'public', 'favicon.png')
+        : path.join(__dirname, '..', 'public', 'favicon.ico');
+
+    tray = new Tray(iconPath);
     tray.setToolTip('Claude Desktop CN');
 
-    const refreshTrayMenu = () => {
-        const visible = !!mainWindow && mainWindow.isVisible();
+    function refreshTrayMenu() {
+        const visible = mainWindow && mainWindow.isVisible();
         const template = [
             {
-                label: visible ? '隐藏窗口' : '显示窗口',
+                label: visible ? '\u9690\u85cf\u7a97\u53e3' : '\u663e\u793a\u7a97\u53e3',
                 click: () => {
-                    if (!mainWindow) {
-                        createWindow();
-                        return;
-                    }
-                    if (mainWindow.isVisible()) {
-                        mainWindow.hide();
-                    } else {
+                    if (!mainWindow || !mainWindow.isVisible()) {
                         showMainWindow();
+                    } else {
+                        mainWindow.hide();
                     }
                 },
             },
             { type: 'separator' },
             {
-                label: '退出',
+                label: '\u9000\u51fa',
                 click: () => {
                     isQuitting = true;
                     app.quit();
@@ -211,7 +167,7 @@ function createTray() {
             },
         ];
         tray.setContextMenu(Menu.buildFromTemplate(template));
-    };
+    }
 
     tray.on('click', () => {
         if (!mainWindow || !mainWindow.isVisible()) {
@@ -244,7 +200,6 @@ function createWindow() {
             contextIsolation: true,
             nodeIntegration: false,
         },
-        // Platform-specific window chrome
         ...(process.platform === 'darwin'
             ? { titleBarStyle: 'hiddenInset', trafficLightPosition: { x: 12, y: 12 } }
             : {
@@ -257,10 +212,9 @@ function createWindow() {
             }),
         icon: getWindowIconPath(),
         backgroundColor: '#1f1f1d',
-        show: false, // Show after ready-to-show to prevent flash
+        show: false,
     });
 
-    // Reset zoom to default on startup & register zoom shortcuts
     mainWindow.once('ready-to-show', () => {
         if (startupWatchdog) {
             clearTimeout(startupWatchdog);
@@ -271,12 +225,10 @@ function createWindow() {
         appendMainLog('window', 'ready-to-show');
     });
 
-    // Zoom keyboard shortcuts 鈥?Electron doesn't handle Ctrl+= (plus) by default on some layouts
     const TITLE_BAR_BASE_HEIGHT = 44;
     const applyZoom = (factor) => {
         const wc = mainWindow.webContents;
         wc.setZoomFactor(factor);
-        // Keep native title bar overlay at consistent visual size regardless of zoom
         if (process.platform !== 'darwin') {
             try {
                 mainWindow.setTitleBarOverlay({
@@ -286,7 +238,6 @@ function createWindow() {
                 });
             } catch (_) {}
         }
-        // Notify renderer so CSS can compensate
         wc.send('zoom-changed', factor);
     };
 
@@ -307,13 +258,10 @@ function createWindow() {
     });
 
     if (isDev) {
-        // In development, load from Vite dev server
         mainWindow.loadURL('http://localhost:3000');
     } else {
-        // In production, load the built files
         mainWindow.loadFile(path.join(__dirname, '..', 'dist', 'index.html'));
     }
-    // mainWindow.webContents.openDevTools();
 
     mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription, validatedURL, isMainFrame) => {
         if (!isMainFrame) return;
@@ -366,7 +314,6 @@ function createWindow() {
         }
     }, 12000);
 
-    // Open all external links in the system browser, not in the app
     mainWindow.webContents.setWindowOpenHandler(({ url }) => {
         if (url.startsWith('http://') || url.startsWith('https://')) {
             shell.openExternal(url);
@@ -374,7 +321,6 @@ function createWindow() {
         return { action: 'deny' };
     });
     mainWindow.webContents.on('will-navigate', (event, url) => {
-        // Allow hash navigation (file:// with #) and localhost dev server
         if (url.startsWith('file://') || url.startsWith('http://localhost')) return;
         event.preventDefault();
         shell.openExternal(url);
@@ -395,7 +341,7 @@ function createWindow() {
                 const visible = mainWindow.isVisible();
                 const template = [
                     {
-                        label: visible ? '隐藏窗口' : '显示窗口',
+                        label: visible ? '\u9690\u85cf\u7a97\u53e3' : '\u663e\u793a\u7a97\u53e3',
                         click: () => {
                             if (!mainWindow || !mainWindow.isVisible()) {
                                 showMainWindow();
@@ -406,7 +352,7 @@ function createWindow() {
                     },
                     { type: 'separator' },
                     {
-                        label: '退出',
+                        label: '\u9000\u51fa',
                         click: () => {
                             isQuitting = true;
                             app.quit();
@@ -417,7 +363,7 @@ function createWindow() {
                 if (!hasShownTrayHint && process.platform === 'win32' && typeof tray.displayBalloon === 'function') {
                     tray.displayBalloon({
                         title: 'Claude Desktop CN',
-                        content: '已最小化到系统托盘，右键托盘图标可以退出应用。',
+                        content: '\u5df2\u6700\u5c0f\u5316\u5230\u7cfb\u7edf\u6258\u76d8\uff0c\u53f3\u952e\u6258\u76d8\u56fe\u6807\u53ef\u4ee5\u9000\u51fa\u5e94\u7528\u3002',
                         iconType: 'info',
                     });
                     hasShownTrayHint = true;
@@ -438,11 +384,7 @@ if (isWindows) {
 
 app.whenReady().then(() => {
     app.setAppUserModelId('com.claude.desktop.cn');
-    // macOS: clear quarantine flags on bundled bun binary. Downloaded .dmg/.zip
-    // files get Apple's com.apple.quarantine xattr, and since our bun binary is
-    // unsigned, Gatekeeper silently blocks execution 鈥?the engine subprocess just
-    // exits immediately with no output. This one-liner strips the flag so bun can
-    // run. Safe to call every launch (no-op if already cleared or on non-Mac).
+
     if (process.platform === 'darwin') {
         try {
             const engineBin = path.join(app.isPackaged ? process.resourcesPath : path.join(__dirname, '..'), 'engine', 'bin');
@@ -450,7 +392,6 @@ app.whenReady().then(() => {
         } catch (_) {}
     }
 
-    // Start Bridge Server
     const server = initServer();
     server.listen(30080, '127.0.0.1', () => {
         console.log('Bridge Server running on http://127.0.0.1:30080');
@@ -459,11 +400,8 @@ app.whenReady().then(() => {
     createTray();
     createWindow();
 
-    // No SDK subprocess needed 鈥?using direct API calls
     enableNodeModeForChildProcesses();
 
-    // Auto-update is disabled in this local Chinese build.
-    // The upstream app checks for updates frequently and may replace local changes.
     if (!isDev && process.env.CLAUDE_DESKTOP_ENABLE_AUTO_UPDATE === '1') {
         autoUpdater.setFeedURL({
             provider: 'generic',
@@ -491,9 +429,6 @@ app.whenReady().then(() => {
             if (mainWindow) {
                 mainWindow.webContents.send('update-status', { type: 'downloaded', version: info.version });
             }
-            // Don't auto-quit 鈥?let the user click "Relaunch" in the UI.
-            // On Mac, quitAndInstall's isForceRunAfter param is ignored,
-            // so we use app.relaunch() + app.exit() to ensure the app restarts.
         });
 
         autoUpdater.on('error', (err) => {
@@ -507,8 +442,6 @@ app.whenReady().then(() => {
             console.log('[Update] Already up-to-date:', info.version);
         });
 
-        // Check for updates after 15 seconds (give network time to settle),
-        // then every 10 minutes (more frequent for users on unstable networks)
         const doCheck = () => {
             console.log('[Update] Checking for updates...');
             autoUpdater.checkForUpdates().catch(err => {
@@ -520,7 +453,6 @@ app.whenReady().then(() => {
     }
 
     app.on('activate', () => {
-        // macOS: re-create window when dock icon clicked
         if (BrowserWindow.getAllWindows().length === 0) {
             createWindow();
             return;
@@ -539,12 +471,9 @@ app.on('window-all-closed', () => {
     }
 });
 
-// IPC Handlers for future bridge communication
 ipcMain.handle('get-app-path', () => app.getPath('userData'));
 ipcMain.handle('get-platform', () => process.platform);
 ipcMain.handle('install-update', () => {
-    // On Mac, autoUpdater.quitAndInstall() doesn't reliably relaunch the app.
-    // Use app.relaunch() + app.exit() to ensure the app restarts on all platforms.
     if (process.platform === 'darwin') {
         app.relaunch();
         app.exit(0);
@@ -560,18 +489,14 @@ ipcMain.handle('resize-window', (_, width, height) => {
     }
 });
 
-// Open the folder containing the given file path in system explorer
-// Returns true if opened, false if file/folder not found
-const recentlyOpenedFolders = new Map(); // path 鈫?timestamp, prevents duplicate opens
+const recentlyOpenedFolders = new Map();
 ipcMain.handle('show-item-in-folder', (event, filePath) => {
     if (!filePath || !fs.existsSync(filePath)) return false;
-    // Deduplicate: ignore if same folder was opened within last 2 seconds
     const folder = path.dirname(filePath);
     const now = Date.now();
     const lastOpened = recentlyOpenedFolders.get(folder);
     if (lastOpened && now - lastOpened < 2000) return true;
     recentlyOpenedFolders.set(folder, now);
-    // Cleanup old entries
     for (const [k, v] of recentlyOpenedFolders) {
         if (now - v > 5000) recentlyOpenedFolders.delete(k);
     }
@@ -579,7 +504,6 @@ ipcMain.handle('show-item-in-folder', (event, filePath) => {
     return true;
 });
 
-// Open a folder directly in system explorer
 const recentlyOpenedDirs = new Map();
 ipcMain.handle('open-folder', (event, folderPath) => {
     if (!folderPath || !fs.existsSync(folderPath)) return false;
@@ -676,7 +600,7 @@ ipcMain.handle('select-directory', async () => {
 ipcMain.handle('export-workspace', async (event, workspaceId, contextMarkdown, defaultFilename) => {
     try {
         const result = await dialog.showSaveDialog(mainWindow, {
-            title: '瀵煎嚭妯″瀷瀵硅瘽宸ヤ綔绌洪棿',
+            title: '\u5bfc\u51fa\u5de5\u4f5c\u7a7a\u95f4',
             defaultPath: defaultFilename,
             filters: [
                 { name: 'Zip Archives', extensions: ['zip'] },
@@ -691,19 +615,16 @@ ipcMain.handle('export-workspace', async (event, workspaceId, contextMarkdown, d
         const zipDest = result.filePath;
         const workspacePath = path.join(app.getPath('userData'), 'workspaces', workspaceId);
 
-        // 纭繚瀵瑰簲鐨?workspace 鐩綍瀛樺湪 (鍗充娇涔嬪墠鍥犱负娌℃湁鍙戠敓杩囩浉鍏虫枃浠舵搷浣滆€屾病鍒涘缓)
         if (!fs.existsSync(workspacePath)) {
             fs.mkdirSync(workspacePath, { recursive: true });
         }
 
-        // 鎶婂墠娈靛綊闆嗙殑瀹屾暣鏂囨湰涓婁笅鏂囨斁杩涘幓涓€璧峰綊妗?
         fs.writeFileSync(path.join(workspacePath, 'chat_context.md'), contextMarkdown || '', 'utf-8');
 
-        // 鎵ц寮傛 zip 鎵撳寘淇濆瓨
         return await new Promise((resolve, reject) => {
             const output = fs.createWriteStream(zipDest);
             const archive = archiver('zip', {
-                zlib: { level: 9 } // Sets the compression level.
+                zlib: { level: 9 }
             });
 
             output.on('close', () => {
@@ -715,10 +636,7 @@ ipcMain.handle('export-workspace', async (event, workspaceId, contextMarkdown, d
             });
 
             archive.pipe(output);
-
-            // 灏嗘暣涓枃浠跺す閲岀殑鎵€鏈夋枃浠跺钩鎽婂鍏ヨ繖涓帇缂╁寘閲?(涓嶇敤澶氬涓€灞傛枃浠跺す澹?
             archive.directory(workspacePath, false);
-
             archive.finalize();
         });
     } catch (err) {
@@ -726,5 +644,3 @@ ipcMain.handle('export-workspace', async (event, workspaceId, contextMarkdown, d
         throw err;
     }
 });
-
-
