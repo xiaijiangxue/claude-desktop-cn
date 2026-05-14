@@ -40,13 +40,13 @@ jobs:
         working-directory: engine
         run: bun install
 
-      - name: Compile engine to single binary
+      - name: Copy Bun runtime into app resources
         shell: pwsh
-        working-directory: engine
         run: |
-          New-Item -ItemType Directory -Force -Path bin | Out-Null
-          bun build ./bin/claude-haha --compile --outfile bin/claude-haha.exe
-          Get-ChildItem bin | Format-Table Name,Length,LastWriteTime
+          New-Item -ItemType Directory -Force -Path engine/bin | Out-Null
+          $bun = (Get-Command bun).Source
+          Copy-Item -LiteralPath $bun -Destination engine/bin/bun.exe -Force
+          Get-ChildItem engine/bin | Format-Table Name,Length,LastWriteTime
 
       - name: Write build-time secrets
         shell: pwsh
@@ -113,13 +113,13 @@ jobs:
         working-directory: engine
         run: bun install
 
-      - name: Compile engine to single binary
-        working-directory: engine
+      - name: Copy Bun runtime into app resources
         run: |
-          mkdir -p bin
-          bun build ./bin/claude-haha --compile --outfile bin/claude-haha
-          chmod +x bin/claude-haha
-          ls -lah bin/claude-haha
+          mkdir -p engine/bin
+          BUN_PATH=$(which bun)
+          cp "$BUN_PATH" engine/bin/bun
+          chmod +x engine/bin/bun
+          ls -la engine/bin
 
       - name: Write build-time secrets
         env:
