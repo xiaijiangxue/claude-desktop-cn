@@ -32,57 +32,29 @@
     "files": [
       "dist/**/*",
       "electron/**/*",
-      "node_modules/**/*"
+      "node_modules/**/*",
+      "!node_modules/**/*.md",
+      "!node_modules/**/README*",
+      "!node_modules/**/CHANGELOG*",
+      "!node_modules/**/LICENSE*",
+      "!node_modules/**/HISTORY*",
+      "!node_modules/**/test/**",
+      "!node_modules/**/tests/**",
+      "!node_modules/**/__tests__/**",
+      "!node_modules/**/spec/**",
+      "!node_modules/**/*.map",
+      "!node_modules/**/.github/**",
+      "!node_modules/**/.vscode/**",
+      "!node_modules/**/docs/**",
+      "!node_modules/**/examples/**",
+      "!node_modules/**/benchmark/**"
     ],
     "asarUnpack": [],
     "extraResources": [
       {
-        "from": "engine/src",
-        "to": "engine/src",
-        "filter": [
-          "**/*.ts",
-          "**/*.tsx",
-          "**/*.js",
-          "**/*.json",
-          "**/*.md",
-          "**/*.txt"
-        ]
-      },
-      {
         "from": "engine/bin",
-        "to": "engine/bin"
-      },
-      {
-        "from": "engine/preload.ts",
-        "to": "engine/preload.ts"
-      },
-      {
-        "from": "engine/bunfig.toml",
-        "to": "engine/bunfig.toml"
-      },
-      {
-        "from": "engine/package.json",
-        "to": "engine/package.json"
-      },
-      {
-        "from": "engine/tsconfig.json",
-        "to": "engine/tsconfig.json"
-      },
-      {
-        "from": "engine/stubs",
-        "to": "engine/stubs"
-      },
-      {
-        "from": "engine/node_modules",
-        "to": "engine/node_modules"
-      },
-      {
-        "from": "engine/vision-helper.ts",
-        "to": "engine/vision-helper.ts"
-      },
-      {
-        "from": "engine/.env",
-        "to": "engine/.env"
+        "to": "engine/bin",
+        "filter": ["claude-haha"]
       },
       {
         "from": "public/favicon.ico",
@@ -100,24 +72,17 @@
     },
     "win": {
       "artifactName": "Claude-Desktop-CN-Setup-${version}.${ext}",
-      "target": [
-        "nsis"
-      ],
+      "target": ["nsis"],
       "icon": "public/favicon.ico"
     },
     "mac": {
-      "target": [
-        "dmg",
-        "zip"
-      ],
+      "target": ["dmg", "zip"],
       "icon": "public/icon-mac.png",
-      "category": "public.app-category.productivity"
+      "category": "public.app-category.productivity",
+      "compression": "maximum"
     },
     "linux": {
-      "target": [
-        "AppImage",
-        "deb"
-      ],
+      "target": ["AppImage", "deb"],
       "icon": "public/favicon.png",
       "category": "Utility"
     },
